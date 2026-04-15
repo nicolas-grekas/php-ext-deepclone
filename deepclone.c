@@ -69,6 +69,22 @@ extern PHPAPI zend_class_entry *reflector_ptr;
 extern PHPAPI zend_class_entry *reflection_type_ptr;
 extern PHPAPI zend_class_entry *reflection_property_ptr;
 
+/* PHPAPI helpers exposed by ext/reflection in PHP 8.6+. They encapsulate the
+ * setRawValue / setRawValueWithoutLazyInitialization logic — including the
+ * trampoline-based hook bypass and lazy-prop/realize handling — that we
+ * previously had to either re-implement or delegate to via a userland
+ * ReflectionProperty round-trip. */
+#if PHP_VERSION_ID >= 80600
+extern PHPAPI void zend_reflection_property_set_raw_value(
+	const zend_property_info *prop, zend_string *unmangled_name,
+	void *cache_slot[3], const zend_class_entry *scope,
+	zend_object *object, zval *value);
+extern PHPAPI void zend_reflection_property_set_raw_value_without_lazy_initialization(
+	const zend_property_info *prop, zend_string *unmangled_name,
+	void *cache_slot[3], const zend_class_entry *scope,
+	zend_object *object, zval *value);
+#endif
+
 /* ── Compatibility shims for older PHP versions ────────────── */
 
 /* zend_zval_value_name() landed in PHP 8.3 (returns "true"/"false"/"null"
@@ -652,7 +668,7 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
 		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
 }
 
-#if PHP_VERSION_ID >= 80400
+#if PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600
 /* fn_proxy slot cached across calls — first invocation fills it via method
  * lookup; subsequent invocations reuse the resolved zend_function*. */
 static zend_function *dc_set_raw_no_lazy_fn = NULL;
@@ -661,9 +677,11 @@ static zend_function *dc_set_raw_no_lazy_fn = NULL;
  * ReflectionProperty instances). Defined later; forward-declared here. */
 static void dc_lazy_refl_cache_dtor(zval *zv);
 
-/* Delegates to ReflectionProperty::setRawValueWithoutLazyInitialization because the
- * required engine helpers (zend_lazy_object_decr_lazy_props, _realize) aren't ZEND_API.
- * Per-request cache keyed on pi — the ReflectionProperty is per-class, not per-instance. */
+/* Pre-PHP-8.6 fallback: PHP 8.6 exposes zend_reflection_property_set_raw_value_
+ * without_lazy_initialization() as PHPAPI, so the lazy-prop dance lives in one
+ * place in ext/reflection. On 8.4/8.5 we delegate through a userland
+ * ReflectionProperty round-trip — construct (cached per pi) + invoke
+ * setRawValueWithoutLazyInitialization($obj, $value). */
 static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 	zend_property_info *pi, zend_string *name, zval *value)
 {
@@ -810,17 +828,23 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 #if PHP_VERSION_ID >= 80400
 	/* Skip the Reflection round-trip when there's no lazy-init to skip. */
 	if (no_lazy_init && !zend_lazy_object_initialized(obj)) {
+# if PHP_VERSION_ID >= 80600
+		zend_reflection_property_set_raw_value_without_lazy_initialization(
+			pi, name, NULL, pi->ce, obj, value);
+		bool ok = !EG(exception);
+# else
 		bool ok = dc_set_raw_value_without_lazy_init(obj, pi, name, value);
-#if PHP_VERSION_ID >= 80100
+# endif
+# if PHP_VERSION_ID >= 80100
 		if (enum_holder_used) {
 			zval_ptr_dtor(&enum_holder);
 		}
-#endif
+# endif
 		return ok;
 	}
 #endif
 
-	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
+	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi) && !call_hooks) {
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.
 		 * Install the new value first so reentrant reads see a valid slot. */
@@ -829,7 +853,14 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		ZVAL_COPY(slot, value);
 		zval_ptr_dtor(&old);
 	}
-#if PHP_VERSION_ID >= 80400
+#if PHP_VERSION_ID >= 80600
+	else if (!call_hooks) {
+		/* Default mode: setRawValue semantics (bypass set hook on hooked
+		 * non-virtual, type-check on typed). One PHPAPI call replaces our
+		 * old trampoline + zend_update_property_ex split. */
+		zend_reflection_property_set_raw_value(pi, name, NULL, pi->ce, obj, value);
+	}
+#elif PHP_VERSION_ID >= 80400
 	else if (!call_hooks && DC_PROP_HAS_HOOKS(pi) && pi->hooks[ZEND_PROPERTY_HOOK_SET]) {
 		zend_function *trampoline = zend_get_property_hook_trampoline(
 			pi, ZEND_PROPERTY_HOOK_SET, name);
