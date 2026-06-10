@@ -5,6 +5,23 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- On PHP 8.6, `deepclone_to_array()` references closures declared in attribute
+  arguments and in parameter default values as `[class, id, line]`, where `id`
+  is the engine's canonical const-expr closure id (see
+  `Closure::fromConstExpr()`). This replaces the per-call declaration-site scan
+  with the engine's non-evaluating walk. Closures declared in class constant
+  values and in property default values have no engine id and keep the
+  site-based form. `deepclone_from_array()` accepts both forms: site-based
+  payloads written on PHP 8.5 keep resolving on PHP 8.6, and engine-id payloads
+  fail with an explicit message on older PHP.
+- On PHP 8.6, closures without a const-expr reference (e.g. created at
+  runtime) are refused through the engine's own `Closure::__serialize()`
+  exception instead of `\DeepClone\NotInstantiableException`.
+
 ## [0.7.2] - 2026-06-10
 
 ### Fixed
